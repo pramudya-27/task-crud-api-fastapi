@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, StrictStr
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, StrictBool, StrictStr
 
 app = FastAPI()
 
@@ -16,6 +16,11 @@ class TaskCreate(BaseModel):
     title: StrictStr | None = None
 
 
+class TaskUpdate(BaseModel):
+    title: StrictStr | None = None
+    done: StrictBool | None = None
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_error_handler(
     request: Request,
@@ -25,6 +30,13 @@ async def validation_error_handler(
         status_code=400,
         content={"error": "Invalid request body"},
     )
+
+
+def find_task(task_id: int):
+    for task in tasks:
+        if task["id"] == task_id:
+            return task
+    return None
 
 
 @app.get("/")
@@ -48,14 +60,15 @@ def get_all_tasks():
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: int):
-    for task in tasks:
-        if task["id"] == task_id:
-            return task
+    task = find_task(task_id)
 
-    return JSONResponse(
-        status_code=404,
-        content={"error": f"Task {task_id} not found"},
-    )
+    if task is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Task {task_id} not found"},
+        )
+
+    return task
 
 
 @app.post("/tasks", status_code=201)
@@ -76,6 +89,61 @@ def create_task(payload: TaskCreate):
 
     tasks.append(new_task)
     return new_task
+
+
+@app.put("/tasks/{task_id}")
+def update_task(task_id: int, payload: TaskUpdate):
+    task = find_task(task_id)
+
+    if task is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Task {task_id} not found"},
+        )
+
+    changes = payload.model_dump(exclude_unset=True)
+
+    if not changes:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Request body cannot be empty"},
+        )
+
+    if "title" in changes:
+        title = changes["title"]
+
+        if title is None or not title.strip():
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Title cannot be empty"},
+            )
+
+        task["title"] = title.strip()
+
+    if "done" in changes:
+        if changes["done"] is None:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Done must be true or false"},
+            )
+
+        task["done"] = changes["done"]
+
+    return task
+
+
+@app.delete("/tasks/{task_id}", status_code=204)
+def delete_task(task_id: int):
+    task = find_task(task_id)
+
+    if task is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Task {task_id} not found"},
+        )
+
+    tasks.remove(task)
+    return Response(status_code=204)
 
 
 if __name__ == "__main__":
