@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 
 # =========================================================
@@ -13,13 +14,6 @@ DATABASE_PATH = Path(__file__).parent / "tasks.db"
 
 
 def get_database_connection():
-    """
-    Creates and returns a connection to the SQLite database.
-
-    row_factory makes query results accessible using
-    column names, such as row["title"].
-    """
-
     connection = sqlite3.connect(DATABASE_PATH)
     connection.row_factory = sqlite3.Row
 
@@ -27,13 +21,6 @@ def get_database_connection():
 
 
 def initialize_database():
-    """
-    Creates the tasks table when it does not exist.
-
-    Three example tasks are inserted only when the table
-    is completely empty.
-    """
-
     with get_database_connection() as connection:
         connection.execute(
             """
@@ -68,16 +55,27 @@ def initialize_database():
         connection.commit()
 
 
+def convert_task_row(row: sqlite3.Row):
+    """
+    Converts an SQLite row into the API response format.
+
+    SQLite stores boolean values as 0 and 1. The API
+    returns them as false and true.
+    """
+
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "done": bool(row["done"]),
+    }
+
+
 # =========================================================
 # APPLICATION CONFIGURATION
 # =========================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Initializes the database when the application starts.
-    """
-
     initialize_database()
     yield
 
@@ -120,6 +118,64 @@ def health_check():
     return {
         "status": "ok",
     }
+
+
+# =========================================================
+# READ ALL TASKS
+# =========================================================
+
+@app.get(
+    "/tasks",
+    summary="List all tasks",
+    description="Returns all tasks stored in SQLite.",
+    tags=["Tasks"],
+)
+def get_all_tasks():
+    with get_database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, title, done
+            FROM tasks
+            ORDER BY id ASC
+            """
+        ).fetchall()
+
+    return [
+        convert_task_row(row)
+        for row in rows
+    ]
+
+
+# =========================================================
+# READ ONE TASK
+# =========================================================
+
+@app.get(
+    "/tasks/{task_id}",
+    summary="Get a task by ID",
+    description="Returns one task from SQLite.",
+    tags=["Tasks"],
+)
+def get_task(task_id: int):
+    with get_database_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT id, title, done
+            FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        ).fetchone()
+
+    if row is None:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "error": "Task not found",
+            },
+        )
+
+    return convert_task_row(row)
 
 
 if __name__ == "__main__":
