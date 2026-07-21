@@ -4,8 +4,13 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, StrictStr
+from fastapi.responses import JSONResponse, Response
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    StrictBool,
+    StrictStr,
+)
 
 
 # =========================================================
@@ -16,6 +21,13 @@ DATABASE_PATH = Path(__file__).parent / "tasks.db"
 
 
 def get_database_connection():
+    """
+    Opens a new SQLite connection.
+
+    A new connection is created for each operation and
+    closed automatically after leaving the with block.
+    """
+
     connection = sqlite3.connect(DATABASE_PATH)
     connection.row_factory = sqlite3.Row
 
@@ -23,6 +35,13 @@ def get_database_connection():
 
 
 def initialize_database():
+    """
+    Creates the database schema and seeds the table.
+
+    Example tasks are inserted only when the tasks table
+    contains no rows.
+    """
+
     with get_database_connection() as connection:
         connection.execute(
             """
@@ -36,7 +55,10 @@ def initialize_database():
         )
 
         result = connection.execute(
-            "SELECT COUNT(*) AS total FROM tasks"
+            """
+            SELECT COUNT(*) AS total
+            FROM tasks
+            """
         ).fetchone()
 
         if result["total"] == 0:
@@ -58,6 +80,10 @@ def initialize_database():
 
 
 def convert_task_row(row: sqlite3.Row):
+    """
+    Converts an SQLite row into a JSON-compatible dictionary.
+    """
+
     return {
         "id": row["id"],
         "title": row["title"],
@@ -65,14 +91,36 @@ def convert_task_row(row: sqlite3.Row):
     }
 
 
+def find_task_row(connection, task_id: int):
+    """
+    Finds one task from SQLite based on its ID.
+    """
+
+    return connection.execute(
+        """
+        SELECT id, title, done
+        FROM tasks
+        WHERE id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+
+
 # =========================================================
-# REQUEST MODEL
+# REQUEST MODELS
 # =========================================================
 
 class TaskCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     title: StrictStr | None = None
+
+
+class TaskUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: StrictStr | None = None
+    done: StrictBool | None = None
 
 
 # =========================================================
@@ -89,9 +137,12 @@ app = FastAPI(
     title="Task API",
     version="2.0",
     description=(
-        "A CRUD API for managing tasks using "
-        "a persistent SQLite database."
+        "A CRUD API for managing to-do tasks using SQLite. "
+        "The API endpoints remain the same as the in-memory "
+        "version, but the data now survives server restarts."
     ),
+    docs_url="/docs",
+    redoc_url="/redoc",
     lifespan=lifespan,
 )
 
@@ -105,6 +156,11 @@ async def validation_error_handler(
     request: Request,
     exception: RequestValidationError,
 ):
+    """
+    Converts FastAPI's default validation response into
+    400 Bad Request as required by the assignment.
+    """
+
     return JSONResponse(
         status_code=400,
         content={
@@ -120,6 +176,8 @@ async def validation_error_handler(
 @app.get(
     "/",
     summary="Get API information",
+    description="Returns basic information about the Task API.",
+    response_description="API information",
     tags=["General"],
 )
 def get_api_information():
@@ -134,6 +192,8 @@ def get_api_information():
 @app.get(
     "/health",
     summary="Check server health",
+    description="Checks whether the API server is running.",
+    response_description="Server health status",
     tags=["General"],
 )
 def health_check():
@@ -149,7 +209,8 @@ def health_check():
 @app.get(
     "/tasks",
     summary="List all tasks",
-    description="Returns all tasks stored in SQLite.",
+    description="Returns all tasks stored in the SQLite database.",
+    response_description="A list containing all tasks",
     tags=["Tasks"],
 )
 def get_all_tasks():
@@ -175,19 +236,28 @@ def get_all_tasks():
 @app.get(
     "/tasks/{task_id}",
     summary="Get a task by ID",
-    description="Returns one task from SQLite.",
+    description=(
+        "Returns one task from SQLite based on its ID. "
+        "An unknown ID returns 404 Not Found."
+    ),
+    response_description="The requested task",
+    responses={
+        404: {
+            "description": "Task not found",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "Task not found",
+                    }
+                }
+            },
+        }
+    },
     tags=["Tasks"],
 )
 def get_task(task_id: int):
     with get_database_connection() as connection:
-        row = connection.execute(
-            """
-            SELECT id, title, done
-            FROM tasks
-            WHERE id = ?
-            """,
-            (task_id,),
-        ).fetchone()
+        row = find_task_row(connection, task_id)
 
     if row is None:
         return JSONResponse(
@@ -208,7 +278,26 @@ def get_task(task_id: int):
     "/tasks",
     status_code=201,
     summary="Create a new task",
-    description="Inserts a new task into SQLite.",
+    description=(
+        "Inserts a new task into SQLite. "
+        "The server sets done to false automatically."
+    ),
+    response_description="The newly created task",
+    responses={
+        201: {
+            "description": "Task successfully created",
+        },
+        400: {
+            "description": "Invalid request body",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "Title is required and cannot be empty",
+                    }
+                }
+            },
+        },
+    },
     tags=["Tasks"],
 )
 def create_task(payload: TaskCreate):
@@ -234,16 +323,172 @@ def create_task(payload: TaskCreate):
         new_task_id = cursor.lastrowid
         connection.commit()
 
-        row = connection.execute(
-            """
-            SELECT id, title, done
-            FROM tasks
-            WHERE id = ?
-            """,
-            (new_task_id,),
-        ).fetchone()
+        row = find_task_row(
+            connection,
+            new_task_id,
+        )
 
     return convert_task_row(row)
+
+
+# =========================================================
+# UPDATE TASK
+# =========================================================
+
+@app.put(
+    "/tasks/{task_id}",
+    summary="Update an existing task",
+    description=(
+        "Updates the title, done status, or both fields "
+        "of an existing task using an SQL UPDATE query."
+    ),
+    response_description="The updated task",
+    responses={
+        400: {
+            "description": "Invalid or empty request body",
+        },
+        404: {
+            "description": "Task not found",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "Task not found",
+                    }
+                }
+            },
+        },
+    },
+    tags=["Tasks"],
+)
+def update_task(task_id: int, payload: TaskUpdate):
+    changes = payload.model_dump(exclude_unset=True)
+
+    if not changes:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Request body cannot be empty",
+            },
+        )
+
+    update_columns = []
+    update_values = []
+
+    if "title" in changes:
+        title = changes["title"]
+
+        if title is None or not title.strip():
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Title cannot be empty",
+                },
+            )
+
+        update_columns.append("title = ?")
+        update_values.append(title.strip())
+
+    if "done" in changes:
+        done = changes["done"]
+
+        if done is None:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "error": "Done must be true or false",
+                },
+            )
+
+        update_columns.append("done = ?")
+        update_values.append(int(done))
+
+    with get_database_connection() as connection:
+        existing_task = find_task_row(
+            connection,
+            task_id,
+        )
+
+        if existing_task is None:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "Task not found",
+                },
+            )
+
+        update_values.append(task_id)
+
+        sql_query = (
+            "UPDATE tasks SET "
+            + ", ".join(update_columns)
+            + " WHERE id = ?"
+        )
+
+        connection.execute(
+            sql_query,
+            update_values,
+        )
+
+        connection.commit()
+
+        updated_row = find_task_row(
+            connection,
+            task_id,
+        )
+
+    return convert_task_row(updated_row)
+
+
+# =========================================================
+# DELETE TASK
+# =========================================================
+
+@app.delete(
+    "/tasks/{task_id}",
+    status_code=204,
+    summary="Delete an existing task",
+    description=(
+        "Deletes a task from SQLite using an SQL DELETE query. "
+        "A successful deletion returns 204 No Content."
+    ),
+    responses={
+        204: {
+            "description": "Task successfully deleted",
+        },
+        404: {
+            "description": "Task not found",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "error": "Task not found",
+                    }
+                }
+            },
+        },
+    },
+    tags=["Tasks"],
+)
+def delete_task(task_id: int):
+    with get_database_connection() as connection:
+        cursor = connection.execute(
+            """
+            DELETE FROM tasks
+            WHERE id = ?
+            """,
+            (task_id,),
+        )
+
+        if cursor.rowcount == 0:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "Task not found",
+                },
+            )
+
+        connection.commit()
+
+    return Response(status_code=204)
 
 
 if __name__ == "__main__":
