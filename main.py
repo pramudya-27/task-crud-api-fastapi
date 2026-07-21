@@ -2,8 +2,10 @@ import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, ConfigDict, StrictStr
 
 
 # =========================================================
@@ -56,18 +58,21 @@ def initialize_database():
 
 
 def convert_task_row(row: sqlite3.Row):
-    """
-    Converts an SQLite row into the API response format.
-
-    SQLite stores boolean values as 0 and 1. The API
-    returns them as false and true.
-    """
-
     return {
         "id": row["id"],
         "title": row["title"],
         "done": bool(row["done"]),
     }
+
+
+# =========================================================
+# REQUEST MODEL
+# =========================================================
+
+class TaskCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: StrictStr | None = None
 
 
 # =========================================================
@@ -89,6 +94,23 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+
+
+# =========================================================
+# VALIDATION ERROR HANDLER
+# =========================================================
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(
+    request: Request,
+    exception: RequestValidationError,
+):
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": "Invalid request body",
+        },
+    )
 
 
 # =========================================================
@@ -174,6 +196,52 @@ def get_task(task_id: int):
                 "error": "Task not found",
             },
         )
+
+    return convert_task_row(row)
+
+
+# =========================================================
+# CREATE TASK
+# =========================================================
+
+@app.post(
+    "/tasks",
+    status_code=201,
+    summary="Create a new task",
+    description="Inserts a new task into SQLite.",
+    tags=["Tasks"],
+)
+def create_task(payload: TaskCreate):
+    if payload.title is None or not payload.title.strip():
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "Title is required and cannot be empty",
+            },
+        )
+
+    clean_title = payload.title.strip()
+
+    with get_database_connection() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO tasks (title, done)
+            VALUES (?, 0)
+            """,
+            (clean_title,),
+        )
+
+        new_task_id = cursor.lastrowid
+        connection.commit()
+
+        row = connection.execute(
+            """
+            SELECT id, title, done
+            FROM tasks
+            WHERE id = ?
+            """,
+            (new_task_id,),
+        ).fetchone()
 
     return convert_task_row(row)
 
